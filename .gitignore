@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+_temp_upload.jpg
+_temp_gradcam.jpg
+Thumbs.db
+.DS_Store
