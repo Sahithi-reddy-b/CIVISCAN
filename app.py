@@ -14,161 +14,86 @@ Features:
 
 import os
 import sys
+import hashlib
 import cv2
 import torch
 import numpy as np
 import streamlit as st
-from PIL import Image
-import io
+import folium
+import time
+from datetime import datetime
+import math
+import pandas as pd
+from pathlib import Path
+from streamlit import components
+
+from auth import (
+    ROLE_CITIZEN,
+    ROLE_MUNICIPAL_OFFICER,
+    clear_session,
+    establish_session,
+    get_current_user,
+    initialize_users_table,
+)
+from database import (
+    add_issue,
+    get_issue_by_id,
+    get_maintenance_cost_rates,
+    initialize_database,
+    link_detections_to_issue,
+    record_inference_detections,
+    update_issue_status,
+)
+
+# add postprocess utilities
+from postprocess import export_geojson, generate_alerts, cluster_hotspots
+from priority import calculate_and_update_priority, cluster_hotspots as analyze_hotspots
+from civiscan.ui.navigation import render_navigation
+from civiscan.ui.theme import apply_theme
+from civiscan.pages.municipal import render_municipal_page
+from civiscan.pages.citizen import render_citizen_dashboard, render_my_reports
+from civiscan.pages.authentication import render_authentication_page
+from civiscan.pages.profile import render_profile
+from civiscan.pages.officer_admin import render_officer_admin
+from civiscan.pages.incoming_media import render_incoming_media_page
+from civiscan.ai.assessment import assess_severity, estimate_repair_cost
+from civiscan.ai.model_service import get_model as get_configured_yolo_model, run_inference
 
 # Add project root to path
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
 from config import (
-    DEVICE, IMAGE_SIZE, NUM_CLASSES, DEFAULT_WEIGHTS,
+    APP_NAME, ACTIVE_CONFIDENCE_THRESHOLD,
+    DEVICE, DEFAULT_WEIGHTS,
     CONFIDENCE_THRESHOLD, NMS_IOU_THRESHOLD,
     YOLOV8_CONFIDENCE_THRESHOLD, YOLOV8_POST_FILTER_CONFIDENCE,
     YOLOV8_NMS_IOU_THRESHOLD, YOLOV8_MAX_PREDICTIONS,
     YOLOV8_MAX_DISPLAY_DETECTIONS, YOLOV8_MIN_BOX_AREA,
     YOLOV8_MIN_ASPECT_RATIO, YOLOV8_MAX_ASPECT_RATIO,
     YOLOV8_AGNOSTIC_NMS, YOLOV8_TTA,
-    CLASS_NAMES, SEVERITY_COLORS,
+    CLASS_NAMES,
+    MODEL_PATH, UPLOAD_DIR, YOLOV8_FALLBACK_PATH, ensure_app_directories,
 )
-from utils import classify_severity
 
 # ─── Page Configuration ──────────────────────────────────
 st.set_page_config(
-    page_title="Pothole Detection — YOLOv8 + YOLOv3",
-    page_icon="🕳️",
+    page_title=APP_NAME,
+    page_icon="🏛️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ─── Custom CSS ───────────────────────────────────────────
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-
-    * { font-family: 'Inter', sans-serif; }
-
-    .main { background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%); }
-
-    .stApp {
-        background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
-    }
-
-    .hero-title {
-        font-size: 3rem;
-        font-weight: 800;
-        background: linear-gradient(135deg, #00d2ff, #3a7bd5, #ff6b6b);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        text-align: center;
-        margin-bottom: 0.5rem;
-    }
-
-    .hero-subtitle {
-        font-size: 1.2rem;
-        color: #a0a0c0;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-
-    .metric-card {
-        background: rgba(255, 255, 255, 0.05);
-        backdrop-filter: blur(10px);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 16px;
-        padding: 1.5rem;
-        text-align: center;
-        transition: transform 0.3s ease;
-    }
-
-    .metric-card:hover {
-        transform: translateY(-5px);
-    }
-
-    .metric-value {
-        font-size: 2.5rem;
-        font-weight: 700;
-        color: #00d2ff;
-    }
-
-    .metric-label {
-        font-size: 0.9rem;
-        color: #a0a0c0;
-        margin-top: 0.3rem;
-    }
-
-    .severity-small { color: #51cf66; }
-    .severity-medium { color: #ffd43b; }
-    .severity-large { color: #ff922b; }
-    .severity-critical { color: #ff6b6b; }
-
-    .detection-box {
-        background: rgba(0, 210, 255, 0.05);
-        border: 1px solid rgba(0, 210, 255, 0.2);
-        border-radius: 12px;
-        padding: 1rem;
-        margin: 0.5rem 0;
-    }
-
-    .concept-card {
-        background: rgba(255, 255, 255, 0.03);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 12px;
-        padding: 1.2rem;
-        margin: 0.5rem 0;
-    }
-
-    div[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #1a1a3e 0%, #0f0c29 100%);
-    }
-
-    .stButton > button {
-        background: linear-gradient(135deg, #00d2ff, #3a7bd5);
-        color: white;
-        border: none;
-        border-radius: 12px;
-        padding: 0.7rem 2rem;
-        font-weight: 600;
-        transition: all 0.3s ease;
-    }
-
-    .stButton > button:hover {
-        transform: scale(1.05);
-        box-shadow: 0 5px 20px rgba(0, 210, 255, 0.4);
-    }
-
-    .model-badge {
-        display: inline-block;
-        padding: 4px 12px;
-        border-radius: 20px;
-        font-size: 0.8rem;
-        font-weight: 600;
-        margin: 2px;
-    }
-
-    .badge-v8 {
-        background: linear-gradient(135deg, #51cf66, #37b24d);
-        color: white;
-    }
-
-    .badge-v3 {
-        background: linear-gradient(135deg, #748ffc, #4c6ef5);
-        color: white;
-    }
-</style>
-""", unsafe_allow_html=True)
-
+initialize_database()
+initialize_users_table()
 
 # ─── Model Loading (cached) ──────────────────────────────
 
 def _check_yolov8_weights():
-    """Check if fine-tuned YOLOv8 weights exist."""
+    """Resolve the configured model first, then use the existing trained checkpoint."""
     candidates = [
-        os.path.join(PROJECT_ROOT, "yolov8_pothole_best.pt"),
+        str(MODEL_PATH),
+        str(YOLOV8_FALLBACK_PATH),
         os.path.join(PROJECT_ROOT, "runs", "pothole_yolov8", "weights", "best.pt"),
         os.path.join(PROJECT_ROOT, "runs", "pothole_yolov8", "weights", "last.pt"),
     ]
@@ -181,12 +106,11 @@ def _check_yolov8_weights():
 @st.cache_resource
 def get_yolov8_model():
     """Load fine-tuned YOLOv8 model."""
-    from ultralytics import YOLO
-    weights = _check_yolov8_weights()
-    if weights:
-        model = YOLO(weights)
-        return model, weights
-    return None, None
+    try:
+        model, weights = get_configured_yolo_model()
+    except FileNotFoundError:
+        return None, None
+    return model, str(weights)
 
 
 @st.cache_resource
@@ -195,13 +119,6 @@ def get_yolov3_model():
     from model import load_model
     model = load_model(DEFAULT_WEIGHTS, DEVICE)
     return model
-
-
-@st.cache_resource
-def get_gradcam(_model):
-    """Initialize Grad-CAM once and cache it."""
-    from gradcam import GradCAM
-    return GradCAM(_model)
 
 
 # ─── Detection Functions ─────────────────────────────────
@@ -237,47 +154,24 @@ def _filter_detections(boxes, img_w, img_h):
 def detect_with_yolov8(uploaded_file, model,
                        conf_thresh=YOLOV8_CONFIDENCE_THRESHOLD,
                        iou_thresh=YOLOV8_NMS_IOU_THRESHOLD):
-    """Run detection using Optimized YOLOv8 predict pipeline."""
+    """Run the shared CiviScan inference service for an uploaded image."""
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     if image is None:
-        return None, None, []
-
-    temp_path = os.path.join(PROJECT_ROOT, "_temp_upload.jpg")
-    cv2.imwrite(temp_path, image)
-
-    # 1. Inference-time strict optimizations
-    results = model.predict(
-        temp_path, 
-        conf=conf_thresh,
+        return None, None, [], None
+    inference = run_inference(
+        image,
+        source_name=getattr(uploaded_file, "name", "upload"),
+        model=model,
+        model_path=Path(_check_yolov8_weights()) if _check_yolov8_weights() else None,
+        confidence=conf_thresh,
         iou=iou_thresh,
-        agnostic_nms=YOLOV8_AGNOSTIC_NMS,
-        max_det=YOLOV8_MAX_PREDICTIONS,
-        augment=YOLOV8_TTA,
-        verbose=False
     )
-
-    original = image.copy()
-    h, w = original.shape[:2]
-    raw_detections = []
-
-    for result in results:
-        boxes = result.boxes
-        if boxes is not None and len(boxes) > 0:
-            for box in boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                raw_detections.append([x1, y1, x2, y2, float(box.conf[0]), int(box.cls[0])])
-
-    # 2. Filter False Positives
-    detections = _filter_detections(raw_detections, w, h)
-
-    # 3. Clean Output
-    annotated = _draw_v8(original, detections)
-
-    if os.path.exists(temp_path):
-        os.remove(temp_path)
-
-    return original, annotated, detections
+    detections = [
+        [*item["bbox"], item["confidence"], item["class_id"]]
+        for item in inference.detections
+    ]
+    return inference.original, inference.annotated, detections, inference
 
 
 def detect_with_yolov3(uploaded_file, model, conf_thresh, nms_thresh):
@@ -356,137 +250,403 @@ def _draw_v8(image, detections):
     return img
 
 
-def generate_gradcam_overlay(uploaded_file, model):
-    """Generate Grad-CAM for uploaded image using YOLOv3-Tiny."""
-    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
-    temp_path = os.path.join(PROJECT_ROOT, "_temp_gradcam.jpg")
-    cv2.imwrite(temp_path, image)
-
-    gradcam = get_gradcam(model)
-    heatmap, overlay, original = gradcam.generate(temp_path)
-
-    if os.path.exists(temp_path):
-        os.remove(temp_path)
-
-    return heatmap, overlay, original
-
+def _class_name(class_id, model=None):
+    """Resolve class labels from model metadata for future multi-class weights."""
+    names = getattr(model, "names", None)
+    if isinstance(names, dict):
+        return str(names.get(class_id, f"class_{class_id}"))
+    if isinstance(names, (list, tuple)) and 0 <= class_id < len(names):
+        return str(names[class_id])
+    if 0 <= class_id < len(CLASS_NAMES):
+        return CLASS_NAMES[class_id]
+    return f"class_{class_id}"
 
 # ─── Main App ─────────────────────────────────────────────
 
-def main():
-    # Check available models
-    v8_model, v8_weights = get_yolov8_model()
-    v3_model = get_yolov3_model()
+def _priority_from_severity(severity):
+    """Map the existing severity category to a transparent initial priority."""
+    priority_mapping = {
+        "low": (25.0, "Low"),
+        "small": (25.0, "Low"),
+        "medium": (55.0, "Moderate"),
+        "high": (85.0, "Critical"),
+        "large": (85.0, "Critical"),
+        "critical": (100.0, "Critical"),
+    }
+    return priority_mapping.get(str(severity).lower(), (25.0, "Low"))
 
+
+def _display_submitted_report(report):
+    """Display the result of a successful issue submission."""
+    st.success("Report submitted successfully")
+    st.markdown(f"**Issue ID:** {report['issue_id']}")
+    st.markdown(f"**Category:** {report['category']}")
+    st.markdown(f"**Severity:** {report['severity']}")
+    st.markdown(f"**Priority:** {report['priority_label']} ({report['priority_score']:.0f})")
+    cost = report.get("estimated_repair_cost")
+    st.markdown(
+        f"**Indicative repair estimate:** ₹{cost:.2f}"
+        if cost is not None
+        else "**Indicative repair estimate:** Not configured"
+    )
+    st.markdown(f"**Status:** {report['status']}")
+
+def _logout():
+    """Clear authentication state for the current browser session."""
+    clear_session(st.session_state)
+
+
+def _render_login_page():
+    """Render login and registration forms for unauthenticated users."""
+    render_authentication_page()
+
+
+def _render_role_navigation(user) -> str:
+    """Render the shared role-aware navigation and apply the selected theme."""
+    page, theme, logout = render_navigation(st, user)
+    apply_theme(st, theme)
+    if logout:
+        _logout()
+        st.rerun()
+    return page
+
+
+def _render_placeholder_dashboard(page: str):
+    """Render navigation placeholders until later dashboard steps are implemented."""
+    role = st.session_state["role"]
+    st.markdown(f"## {role} Dashboard")
+    st.write(f"Welcome, {st.session_state['name']}.")
+    st.info(f"{page} will be implemented in a later step.")
+
+
+def _normalise_value(value):
+    return str(value).strip() if value is not None else ""
+
+
+def _valid_coordinates(issue):
+    try:
+        latitude = float(issue.get("latitude"))
+        longitude = float(issue.get("longitude"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(latitude) or not math.isfinite(longitude):
+        return None
+    if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+        return None
+    return latitude, longitude
+
+
+def _render_municipal_dashboard(section="Overview"):
+    """Render the Municipal Officer dashboard from persisted issue records."""
+    st.markdown(f"# {section}")
+    st.write(f"Welcome, {st.session_state['name']}.")
+    issues = calculate_and_update_priority(st.session_state.get("current_user"))
+    hotspot_result = analyze_hotspots(issues)
+    hotspot_summaries = hotspot_result[0]
+
+    priority_counts = {
+        label: sum(_normalise_value(issue.get("priority_label")).lower() == label.lower() for issue in issues)
+        for label in ("High", "Medium", "Low")
+    }
+    status_counts = {
+        "NEW": sum(_normalise_value(issue.get("status")).upper() == "NEW" for issue in issues),
+        "RESOLVED": sum(_normalise_value(issue.get("status")).upper() == "RESOLVED" for issue in issues),
+    }
+
+    summary_cards = [
+        ("Total Issues", len(issues)),
+        ("High Priority", priority_counts["High"]),
+        ("Medium Priority", priority_counts["Medium"]),
+        ("Low Priority", priority_counts["Low"]),
+        ("New Issues", status_counts["NEW"]),
+        ("Resolved Issues", status_counts["RESOLVED"]),
+    ]
+    columns = st.columns(len(summary_cards))
+    for column, (label, value) in zip(columns, summary_cards):
+        column.metric(label, value)
+
+    st.markdown("## All Civic Issues")
+    if not issues:
+        st.info("No civic issues have been submitted yet.")
+        st.markdown("## Analytics")
+        st.info("Analytics will appear after civic issues are submitted.")
+        st.markdown("## Issue Map")
+        st.info("The map will appear when issues with valid coordinates are available.")
+        return
+
+    categories = sorted({_normalise_value(issue.get("category")) for issue in issues if issue.get("category")})
+    priorities = sorted({_normalise_value(issue.get("priority_label")) for issue in issues if issue.get("priority_label")})
+    severities = sorted({_normalise_value(issue.get("severity")) for issue in issues if issue.get("severity")})
+    statuses = sorted({_normalise_value(issue.get("status")) for issue in issues if issue.get("status")})
+
+    with st.expander("Filters", expanded=True):
+        filter_columns = st.columns(4)
+        category_filter = filter_columns[0].selectbox("Category", ["All"] + categories)
+        priority_filter = filter_columns[1].selectbox("Priority", ["All"] + priorities)
+        severity_filter = filter_columns[2].selectbox("Severity", ["All"] + severities)
+        status_filter = filter_columns[3].selectbox("Status", ["All"] + statuses)
+
+    filtered_issues = [
+        issue for issue in issues
+        if (category_filter == "All" or _normalise_value(issue.get("category")) == category_filter)
+        and (priority_filter == "All" or _normalise_value(issue.get("priority_label")) == priority_filter)
+        and (severity_filter == "All" or _normalise_value(issue.get("severity")) == severity_filter)
+        and (status_filter == "All" or _normalise_value(issue.get("status")) == status_filter)
+    ]
+
+    table_rows = [
+        {
+            "Issue ID": issue.get("issue_id"),
+            "Category": issue.get("category") or "N/A",
+            "Confidence": issue.get("confidence"),
+            "Severity": issue.get("severity") or "N/A",
+            "Priority": issue.get("priority_label") or "N/A",
+            "Priority Score": issue.get("priority_score"),
+            "Estimated Cost": issue.get("estimated_repair_cost"),
+            "Latitude": issue.get("latitude"),
+            "Longitude": issue.get("longitude"),
+            "Reported Date": issue.get("reported_at") or "N/A",
+            "Status": issue.get("status") or "N/A",
+        }
+        for issue in filtered_issues
+    ]
+    if table_rows:
+        st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No issues match the selected filters.")
+
+    st.markdown("## Issue Details")
+    if not filtered_issues:
+        st.info("Select different filters to view issue details.")
+    else:
+        issue_options = [issue["issue_id"] for issue in filtered_issues]
+        selected_issue_id = st.selectbox("Select Issue ID", issue_options)
+        selected_issue = next(
+            issue for issue in filtered_issues if issue["issue_id"] == selected_issue_id
+        )
+        detail_columns = st.columns([1, 2])
+        with detail_columns[0]:
+            image_path = selected_issue.get("image_path")
+            if image_path and os.path.exists(image_path):
+                st.image(image_path, caption="Uploaded issue image", use_container_width=True)
+            else:
+                st.info("Original uploaded image is unavailable.")
+        with detail_columns[1]:
+            st.markdown(f"**Detected category:** {selected_issue.get('category') or 'N/A'}")
+            st.markdown(f"**Confidence:** {selected_issue.get('confidence') if selected_issue.get('confidence') is not None else 'N/A'}")
+            st.markdown(f"**Severity:** {selected_issue.get('severity') or 'N/A'}")
+            st.markdown(f"**Priority score:** {selected_issue.get('priority_score') if selected_issue.get('priority_score') is not None else 'N/A'}")
+            st.markdown(f"**Priority label:** {selected_issue.get('priority_label') or 'N/A'}")
+            st.markdown(f"**Estimated repair cost:** ₹{selected_issue.get('estimated_repair_cost') if selected_issue.get('estimated_repair_cost') is not None else 'N/A'}")
+            st.markdown(f"**Latitude:** {selected_issue.get('latitude') if selected_issue.get('latitude') is not None else 'N/A'}")
+            st.markdown(f"**Longitude:** {selected_issue.get('longitude') if selected_issue.get('longitude') is not None else 'N/A'}")
+            st.markdown(f"**Reported date:** {selected_issue.get('reported_at') or 'N/A'}")
+            st.markdown(f"**Citizen/user ID:** {selected_issue.get('user_id') or 'N/A'}")
+            st.markdown(f"**Description:** {selected_issue.get('description') or 'N/A'}")
+            st.markdown(f"**Current status:** {selected_issue.get('status') or 'N/A'}")
+
+        st.markdown("### Update Status")
+        status_options = ["NEW", "VERIFIED", "IN PROGRESS", "RESOLVED", "REOPENED"]
+        current_status = _normalise_value(selected_issue.get("status")).upper()
+        selected_status = st.selectbox(
+            "New status",
+            status_options,
+            index=status_options.index(current_status) if current_status in status_options else 0,
+        )
+        if st.button("Update Status", key=f"update_status_{selected_issue_id}"):
+            if update_issue_status(
+                selected_issue_id,
+                selected_status,
+                actor=st.session_state.get("current_user"),
+            ):
+                calculate_and_update_priority(st.session_state.get("current_user"))
+                st.success("Issue status updated successfully.")
+                st.rerun()
+            else:
+                st.error("The selected issue could not be updated.")
+
+    st.markdown("## Analytics")
+    analytics_frame = pd.DataFrame(issues)
+    chart_columns = st.columns(2)
+    for column, field, title in [
+        (chart_columns[0], "category", "Issues by Category"),
+        (chart_columns[1], "severity", "Issues by Severity"),
+        (chart_columns[0], "priority_label", "Issues by Priority"),
+        (chart_columns[1], "status", "Issues by Status"),
+    ]:
+        values = analytics_frame[field].fillna("Unknown").replace("", "Unknown").value_counts()
+        column.markdown(f"**{title}**")
+        column.bar_chart(values)
+
+    st.markdown("## Priority Analysis")
+    priority_analysis_columns = st.columns(3)
+    priority_groups = {
+        "High Priority Issues": "High",
+        "Medium Priority Issues": "Medium",
+        "Low Priority Issues": "Low",
+    }
+    for column, (title, priority_label) in zip(priority_analysis_columns, priority_groups.items()):
+        matching = [issue for issue in issues if issue.get("priority_label") == priority_label]
+        column.markdown(f"**{title}: {len(matching)}**")
+        if matching:
+            column.dataframe(
+                pd.DataFrame([
+                    {"Issue ID": issue.get("issue_id"), "Category": issue.get("category"), "Score": issue.get("priority_score")}
+                    for issue in matching
+                ]),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            column.caption("None")
+
+    st.markdown("## Hotspot Analysis")
+    if not hotspot_summaries:
+        st.info("Insufficient data for hotspot analysis.")
+    else:
+        hotspot_frame = pd.DataFrame([
+            {
+                "Hotspot ID": hotspot["hotspot_id"],
+                "Issues": hotspot["count"],
+                "Dominant Category": hotspot["dominant_category"],
+                "Average Severity": hotspot["average_severity"],
+                "Average Priority": hotspot["average_priority"],
+            }
+            for hotspot in hotspot_summaries
+        ])
+        st.dataframe(hotspot_frame, use_container_width=True, hide_index=True)
+        hotspot_counts = pd.Series(
+            {str(hotspot["hotspot_id"]): hotspot["count"] for hotspot in hotspot_summaries},
+            name="Issues",
+        )
+        st.markdown("**Issues by Hotspot**")
+        st.bar_chart(hotspot_counts)
+
+    st.markdown("## Issue Map")
+    mapped_issues = [(issue, _valid_coordinates(issue)) for issue in issues]
+    mapped_issues = [(issue, coordinates) for issue, coordinates in mapped_issues if coordinates]
+    if not mapped_issues:
+        st.info("No issues have valid latitude and longitude values for mapping.")
+        return
+
+    center_latitude = sum(coordinates[0] for _, coordinates in mapped_issues) / len(mapped_issues)
+    center_longitude = sum(coordinates[1] for _, coordinates in mapped_issues) / len(mapped_issues)
+    issue_map = folium.Map(location=(center_latitude, center_longitude), zoom_start=12)
+    marker_colors = {"high": "red", "medium": "orange", "low": "green"}
+    for issue, coordinates in mapped_issues:
+        priority = _normalise_value(issue.get("priority_label")).lower()
+        popup = (
+            f"Issue ID: {issue.get('issue_id')}<br>"
+            f"Category: {issue.get('category') or 'N/A'}<br>"
+            f"Severity: {issue.get('severity') or 'N/A'}<br>"
+            f"Priority: {issue.get('priority_label') or 'N/A'}<br>"
+            f"Cost: {issue.get('estimated_repair_cost') if issue.get('estimated_repair_cost') is not None else 'N/A'}<br>"
+            f"Status: {issue.get('status') or 'N/A'}"
+        )
+        folium.Marker(
+            location=coordinates,
+            popup=folium.Popup(popup, max_width=300),
+            icon=folium.Icon(color=marker_colors.get(priority, "gray")),
+        ).add_to(issue_map)
+    for hotspot in hotspot_summaries:
+        latitude, longitude = hotspot["center"]
+        popup = (
+            f"Hotspot ID: {hotspot['hotspot_id']}<br>"
+            f"Issues: {hotspot['count']}<br>"
+            f"Dominant category: {hotspot['dominant_category']}<br>"
+            f"Average severity: {hotspot['average_severity']}<br>"
+            f"Average priority: {hotspot['average_priority']}"
+        )
+        folium.Circle(
+            location=(latitude, longitude),
+            radius=50,
+            color="purple",
+            fill=True,
+            fill_opacity=0.15,
+            popup=folium.Popup(popup, max_width=300),
+        ).add_to(issue_map)
+        folium.Marker(
+            location=(latitude, longitude),
+            popup=folium.Popup(popup, max_width=300),
+            icon=folium.Icon(color="purple", icon="info-sign"),
+        ).add_to(issue_map)
+    components.v1.html(issue_map._repr_html_(), height=550)
+
+def main():
+    ensure_app_directories()
+    apply_theme(st, "Light")
+    user = get_current_user(st.session_state)
+    if user is None:
+        _render_login_page()
+        return
+
+    selected_page = _render_role_navigation(user)
+    if selected_page == "My Profile":
+        render_profile(user)
+        return
+    if selected_page == "Officer Administration":
+        render_officer_admin(user)
+        return
+    if user["role"] == ROLE_MUNICIPAL_OFFICER and selected_page == "Incoming Media":
+        render_incoming_media_page(user)
+        return
+    if user["role"] == ROLE_MUNICIPAL_OFFICER and selected_page != "AI Detection":
+        render_municipal_page(selected_page)
+        return
+    if user["role"] == ROLE_CITIZEN and selected_page == "My Reports":
+        render_my_reports(user)
+        return
+    if user["role"] == ROLE_CITIZEN and selected_page == "Dashboard":
+        render_citizen_dashboard(user)
+        return
+
+    # Check available models
+    try:
+        v8_model, v8_weights = get_yolov8_model()
+    except (ImportError, OSError, RuntimeError, ValueError) as error:
+        st.error(f"The configured YOLO model could not be loaded: {error}")
+        return
     has_v8 = v8_model is not None
+    v3_model = None if has_v8 else get_yolov3_model()
 
     # ── Sidebar ───────────────────────────────────────────
     with st.sidebar:
-        st.markdown("## ⚙️ Settings")
+        st.markdown("## Detection settings")
 
-        # Model selector
         if has_v8:
-            model_choice = st.radio(
-                "🧠 Choose Model",
-                ["YOLOv8 (Recommended)", "YOLOv3-Tiny (Custom)"],
-                index=0,
-                help="YOLOv8 uses transfer learning from COCO for much better accuracy"
-            )
+            model_choice = "YOLOv8 (Configured)"
         else:
             model_choice = "YOLOv3-Tiny (Custom)"
-            st.info("YOLOv8 weights not found. Run `python train_yolov8.py` to fine-tune.")
+            st.info("Using the configured YOLOv3-Tiny fallback because YOLOv8 weights were not found.")
 
         if "YOLOv8" in model_choice:
-            conf_thresh = YOLOV8_CONFIDENCE_THRESHOLD
+            conf_thresh = ACTIVE_CONFIDENCE_THRESHOLD
             nms_thresh = YOLOV8_NMS_IOU_THRESHOLD
-            st.info(
-                "YOLOv8 no-retrain cleanup is enforced: "
-                f"conf={YOLOV8_CONFIDENCE_THRESHOLD:.2f}, "
-                f"post-filter>={YOLOV8_POST_FILTER_CONFIDENCE:.2f}, "
-                f"iou={YOLOV8_NMS_IOU_THRESHOLD:.2f}, "
-                f"raw max_det={YOLOV8_MAX_PREDICTIONS}, "
-                f"final max boxes={YOLOV8_MAX_DISPLAY_DETECTIONS}."
-            )
-            st.caption(
-                f"Small boxes under {YOLOV8_MIN_BOX_AREA}px^2 and aspect ratios "
-                f"outside {YOLOV8_MIN_ASPECT_RATIO:.1f}-{YOLOV8_MAX_ASPECT_RATIO:.1f} are removed."
-            )
         else:
-            conf_thresh = st.slider(
-                "Confidence Threshold",
-                min_value=0.05, max_value=0.95, value=CONFIDENCE_THRESHOLD, step=0.05,
-                help="Minimum confidence to show a detection"
-            )
-
-            nms_thresh = st.slider(
-                "NMS IoU Threshold",
-                min_value=0.1, max_value=0.9, value=NMS_IOU_THRESHOLD, step=0.05,
-                help="IoU threshold for Non-Maximum Suppression"
-            )
+            conf_thresh = CONFIDENCE_THRESHOLD
+            nms_thresh = NMS_IOU_THRESHOLD
 
         st.markdown("---")
-
-        # Model info based on selection
-        if "YOLOv8" in model_choice:
-            st.markdown("### 📐 Model: YOLOv8n")
-            st.markdown('<span class="model-badge badge-v8">YOLOv8 Nano</span>',
-                        unsafe_allow_html=True)
-            st.markdown(f"- **Architecture:** YOLOv8n (CSPDarknet)")
-            st.markdown(f"- **Parameters:** ~3.0M")
-            st.markdown(f"- **Input Size:** 640 x 640")
-            st.markdown(f"- **Pre-trained:** COCO (80 classes)")
-            st.markdown(f"- **Fine-tuned:** Pothole dataset")
-            st.markdown(f"- **FPN:** Yes (multi-scale)")
-        else:
-            st.markdown("### 📐 Model: YOLOv3-Tiny")
-            st.markdown('<span class="model-badge badge-v3">Custom YOLOv3</span>',
-                        unsafe_allow_html=True)
-            st.markdown(f"- **Architecture:** YOLOv3-Tiny (Custom)")
-            st.markdown(f"- **Parameters:** ~6.3M")
-            st.markdown(f"- **Input Size:** {IMAGE_SIZE} x {IMAGE_SIZE}")
-            st.markdown(f"- **Device:** {DEVICE}")
-
-        st.markdown("---")
-        st.markdown("### 🎓 DL Concepts Used")
-        concepts = [
-            "CNN Feature Extraction",
-            "Single-Shot Detection",
-            "Anchor Boxes",
-            "Non-Maximum Suppression",
-            "Batch Normalization",
-            "Transfer Learning",
-            "Grad-CAM Explainability",
-            "Data Augmentation",
-            "Feature Pyramid Network",
-            "Grid-based Prediction",
-        ]
-        for c in concepts:
-            st.markdown(f"  ✅ {c}")
+        st.caption("Active model")
+        st.markdown(os.path.basename(v8_weights or DEFAULT_WEIGHTS))
+        st.caption(f"Confidence threshold: {conf_thresh:.2f}")
+        st.caption(f"Processing device: {DEVICE}")
 
     # ── Hero Section ──────────────────────────────────────
-    st.markdown('<div class="hero-title">🕳️ Pothole Detection System</div>',
-                unsafe_allow_html=True)
+    st.title(APP_NAME)
 
     subtitle_model = "YOLOv8" if "YOLOv8" in model_choice else "YOLOv3-Tiny"
     st.markdown(
-        f'<div class="hero-subtitle">'
-        f'Deep Learning-Powered Road Damage Detection using {subtitle_model} | '
-        f'Transfer Learning & Computer Vision'
-        f'</div>',
-        unsafe_allow_html=True
+        f"Detect and report civic infrastructure issues with {subtitle_model}."
     )
 
     # ── Tabs ──────────────────────────────────────────────
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "🔍 Detection", "🔥 Grad-CAM", "📊 About Model", "🎯 Interview Q&A"
-    ])
+    tab1, = st.tabs(["🔍 Detection"])
 
     # ── Tab 1: Detection ──────────────────────────────────
     with tab1:
         active_model = subtitle_model
-        st.markdown(f"### Upload an image to detect potholes ({active_model})")
+        st.markdown(f"### Upload an image for civic-issue detection ({active_model})")
 
         uploaded_file = st.file_uploader(
             "Choose an image...",
@@ -495,17 +655,28 @@ def main():
         )
 
         if uploaded_file is not None:
-            with st.spinner(f"🔍 Detecting potholes with {active_model}..."):
-                uploaded_file.seek(0)
+            upload_bytes = uploaded_file.getvalue()
+            upload_key = hashlib.sha256(upload_bytes).hexdigest()
+            inference_result = None
+            try:
+                with st.spinner(f"🔍 Detecting civic issues with {active_model}..."):
+                    uploaded_file.seek(0)
 
-                if "YOLOv8" in model_choice and has_v8:
-                    original, annotated, detections = detect_with_yolov8(
-                        uploaded_file, v8_model, conf_thresh, nms_thresh
-                    )
-                else:
-                    original, annotated, detections = detect_with_yolov3(
-                        uploaded_file, v3_model, conf_thresh, nms_thresh
-                    )
+                    if "YOLOv8" in model_choice and has_v8:
+                        original, annotated, detections, inference_result = detect_with_yolov8(
+                            uploaded_file, v8_model, conf_thresh, nms_thresh
+                        )
+                    else:
+                        inference_started = time.perf_counter()
+                        original, annotated, detections = detect_with_yolov3(
+                            uploaded_file, v3_model, conf_thresh, nms_thresh
+                        )
+                        inference_seconds = time.perf_counter() - inference_started
+            except (OSError, RuntimeError, ValueError) as error:
+                st.error(f"Image inference failed: {error}")
+                return
+            if inference_result is not None:
+                inference_seconds = inference_result.inference_seconds
 
             if original is not None:
                 # Results
@@ -526,229 +697,256 @@ def main():
                 st.markdown("### 📊 Detection Summary")
 
                 h, w = original.shape[:2]
-                severity_counts = {"Small": 0, "Medium": 0, "Large": 0, "Critical": 0}
-
-                for det in detections:
-                    x1, y1, x2, y2 = det[:4]
-                    sev = classify_severity((x2-x1, y2-y1), (w, h))
-                    severity_counts[sev] += 1
 
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("🕳️ Potholes Found", len(detections))
+                m1.metric("Issues detected", len(detections))
                 m2.metric("📏 Avg Confidence",
                           f"{np.mean([d[4] for d in detections]):.2f}" if detections else "N/A")
-                m3.metric("⚠️ Critical", severity_counts["Critical"])
-                m4.metric("🟢 Small", severity_counts["Small"])
+                m3.metric("Inference time", f"{inference_seconds:.3f}s")
+                m4.metric("Model version", inference_result.model_version[:12] if inference_result else "Legacy")
 
                 if detections:
-                    st.markdown("### 📋 Detection Details")
-                    for i, det in enumerate(detections):
-                        x1, y1, x2, y2, conf, cls_id = det[:6]
-                        sev = classify_severity((x2-x1, y2-y1), (w, h))
-                        sev_class = f"severity-{sev.lower()}"
+                    os.makedirs(str(UPLOAD_DIR), exist_ok=True)
+                    extension = Path(uploaded_file.name).suffix.lower()
+                    if extension not in {".jpg", ".jpeg", ".png", ".bmp"}:
+                        extension = ".jpg"
+                    source_path = os.path.join(str(UPLOAD_DIR), f"{upload_key}{extension}")
+                    if not os.path.exists(source_path):
+                        with open(source_path, "wb") as image_file:
+                            image_file.write(upload_bytes)
+                    annotated_path = os.path.join(str(UPLOAD_DIR), f"{upload_key}_annotated.jpg")
+                    if not cv2.imwrite(annotated_path, annotated):
+                        st.error("Could not save the annotated image.")
+                        return
 
+                    from postprocess import extract_gps_from_image
+                    image_gps = extract_gps_from_image(source_path)
+                    cost_rates = get_maintenance_cost_rates()
+                    enriched = []
+                    persisted_detections = []
+                    for index, det in enumerate(detections):
+                        x1, y1, x2, y2, confidence = map(float, det[:5])
+                        class_id = int(det[5]) if len(det) > 5 else 0
+                        category = _class_name(class_id, v8_model if has_v8 else None)
+                        bbox = [x1, y1, x2, y2]
+                        assessment = assess_severity(category, bbox, (w, h))
+                        priority_score, priority_label = _priority_from_severity(assessment["severity"])
+                        cost_estimate = estimate_repair_cost(category, cost_rates.get(category))
+                        cost = cost_estimate["total_inr"] if cost_estimate else None
+                        if inference_result is not None:
+                            record = dict(inference_result.detections[index])
+                            record["detection_id"] = hashlib.sha256(
+                                f"{upload_key}:{inference_result.model_version}:{index}".encode("utf-8")
+                            ).hexdigest()
+                        else:
+                            record = {
+                                "detection_id": hashlib.sha256(
+                                    f"{upload_key}:legacy:{index}".encode("utf-8")
+                                ).hexdigest(),
+                                "image_filename": uploaded_file.name,
+                                "issue_category": category,
+                                "class_id": class_id,
+                                "confidence": confidence,
+                                "bbox": bbox,
+                                "timestamp": datetime.now().astimezone().isoformat(),
+                                "model_name": "legacy-yolov3",
+                                "model_version": "legacy",
+                                "inference_seconds": inference_seconds,
+                            }
+                        record.update(assessment)
+                        record["estimated_repair_cost"] = cost
+                        persisted_detections.append(record)
+                        enriched.append({
+                            "bbox": bbox,
+                            "confidence": confidence,
+                            "class": class_id,
+                            "category": category,
+                            "severity_category": assessment["severity"],
+                            "severity_reason": assessment["severity_reason"],
+                            "priority": priority_score / 100.0,
+                            "priority_score": priority_score,
+                            "priority_label": priority_label,
+                            "estimated_repair_cost": cost,
+                            "gps": image_gps,
+                        })
+
+                    if persisted_detections:
+                        detection_ids = record_inference_detections(
+                            persisted_detections,
+                            annotated_path,
+                            actor=user,
+                            source_image_path=source_path,
+                        )
+                    else:
+                        detection_ids = []
+
+                    st.markdown("### Detection Details")
+                    category_counts = {}
+                    for det in enriched:
+                        category_counts[det["category"]] = category_counts.get(det["category"], 0) + 1
+                        x1, y1, x2, y2 = map(int, det["bbox"])
+                        cost_label = (
+                            f"₹{det['estimated_repair_cost']:.2f} (estimate)"
+                            if det["estimated_repair_cost"] is not None
+                            else "Not configured"
+                        )
+                        gps = det["gps"]
+                        gps_label = f"{gps[0]:.6f}, {gps[1]:.6f}" if gps else "Not available"
+                        sev_class = f"severity-{det['severity_category'].lower()}"
                         st.markdown(f"""
                         <div class="detection-box">
-                            <strong>Pothole #{i+1}</strong> |
-                            Confidence: <strong>{conf:.3f}</strong> |
-                            Severity: <strong class="{sev_class}">{sev}</strong> |
-                            Box: ({int(x1)}, {int(y1)}) to ({int(x2)}, {int(y2)}) |
-                            Size: {int(x2-x1)} x {int(y2-y1)} px
+                            <strong>{det['category']}</strong> |
+                            Confidence: <strong>{det['confidence']:.3f}</strong> |
+                            Bounding Box: <strong>[{x1}, {y1}, {x2}, {y2}]</strong> |
+                            Severity: <strong class="{sev_class}">{det['severity_category']}</strong> |
+                            Priority: <strong>{det['priority_label']} ({det['priority_score']:.0f}/100)</strong> |
+                            Indicative repair estimate: <strong>{cost_label}</strong> |
+                            GPS: <strong>{gps_label}</strong><br>
+                            <small>{det['severity_reason']}</small>
                         </div>
                         """, unsafe_allow_html=True)
-        else:
-            st.info("👆 Upload an image above to start detecting potholes!")
-
-    # ── Tab 2: Grad-CAM ──────────────────────────────────
-    with tab2:
-        st.markdown("### 🔥 Grad-CAM — Where Does the Model Look?")
-        st.markdown("""
-        **Gradient-weighted Class Activation Mapping** visualizes the regions
-        of the image that the model focuses on when making predictions.
-
-        - 🔴 **Red/Yellow areas**: High attention (model "looks" here)
-        - 🔵 **Blue areas**: Low attention (ignored regions)
-
-        > *Note: Grad-CAM runs on the custom YOLOv3-Tiny model backbone.*
-        """)
-
-        gradcam_file = st.file_uploader(
-            "Upload image for Grad-CAM analysis",
-            type=["jpg", "jpeg", "png"],
-            key="gradcam_upload"
-        )
-
-        if gradcam_file is not None:
-            with st.spinner("🔥 Generating Grad-CAM heatmap..."):
-                gradcam_file.seek(0)
-                try:
-                    heatmap, overlay, original = generate_gradcam_overlay(
-                        gradcam_file, v3_model
+                    st.dataframe(
+                        pd.DataFrame([{"Category": key, "Detections": value} for key, value in category_counts.items()]),
+                        use_container_width=True,
+                        hide_index=True,
                     )
 
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.markdown("#### Original")
-                        st.image(cv2.cvtColor(original, cv2.COLOR_BGR2RGB),
-                                 use_container_width=True)
-                    with col2:
-                        st.markdown("#### Heatmap")
-                        st.image(cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB),
-                                 use_container_width=True)
-                    with col3:
-                        st.markdown("#### Overlay")
-                        st.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB),
-                                 use_container_width=True)
+                    gps_points = [d for d in enriched if d.get("gps")]
+                    if gps_points:
+                        st.markdown("---")
+                        st.markdown("### Map & Hotspots")
+                        eps_m = st.sidebar.slider("Hotspot radius (meters)", 10, 200, 50)
+                        min_samples = st.sidebar.slider("Hotspot min samples", 2, 10, 3)
+                        labels, clusters = cluster_hotspots(enriched, eps_m=eps_m, min_samples=min_samples)
 
-                except Exception as e:
-                    st.error(f"Error generating Grad-CAM: {e}")
+                        lats = [d["gps"][0] for d in gps_points]
+                        lons = [d["gps"][1] for d in gps_points]
+                        center = (float(np.mean(lats)), float(np.mean(lons)))
+                        fmap = folium.Map(location=center, zoom_start=15)
+                        for idx, d in enumerate(enriched):
+                            g = d.get("gps")
+                            if not g:
+                                continue
+                            color = "green" if d["severity_category"] == "Low" else ("orange" if d["severity_category"] == "Medium" else "red")
+                            folium.CircleMarker(
+                                location=(g[0], g[1]),
+                                radius=6,
+                                color=color,
+                                fill=True,
+                                popup=f"{d['category']} | Priority {d['priority_score']:.0f}/100",
+                            ).add_to(fmap)
 
-    # ── Tab 3: About Model ────────────────────────────────
-    with tab3:
-        st.markdown("### 🏗️ Model Architectures")
+                        for cid, info in clusters.items():
+                            c_lat, c_lon = info["center"]
+                            folium.CircleMarker(
+                                location=(c_lat, c_lon),
+                                radius=10,
+                                color="#B58A55",
+                                fill=True,
+                                popup=f"Hotspot {cid} ({info['count']} detections)",
+                            ).add_to(fmap)
 
-        st.markdown("#### YOLOv8n (Primary — High Accuracy)")
-        st.markdown("""
-        ```
-        ┌──────────────────────────────────────────────────────┐
-        │                INPUT IMAGE (3 × 640 × 640)           │
-        └──────────────────────┬───────────────────────────────┘
-                               │
-        ┌──────────────────────▼───────────────────────────────┐
-        │  CSPDarknet BACKBONE (Pre-trained on COCO)           │
-        │  ┌─────────────────────────────────────────────────┐ │
-        │  │ Conv → C2f(32)  → Conv → C2f(64)               │ │
-        │  │ Conv → C2f(128) → Conv → C2f(256)              │ │
-        │  │ SPPF (Spatial Pyramid Pooling Fast)             │ │
-        │  └─────────────────────────────────────────────────┘ │
-        └──────────────────────┬───────────────────────────────┘
-                               │
-        ┌──────────────────────▼───────────────────────────────┐
-        │  NECK — Feature Pyramid Network (FPN + PAN)          │
-        │  ┌─────────────────────────────────────────────────┐ │
-        │  │ Upsample + Concat + C2f (×2)     ← FPN (top-down)│
-        │  │ Conv + Concat + C2f (×2)   ← PAN (bottom-up)   │ │
-        │  │ Multi-scale features: P3, P4, P5               │ │
-        │  └─────────────────────────────────────────────────┘ │
-        └──────────────────────┬───────────────────────────────┘
-                               │
-        ┌──────────────────────▼───────────────────────────────┐
-        │  DETECTION HEAD (Anchor-Free)                        │
-        │  ┌─────────────────────────────────────────────────┐ │
-        │  │ 3 detection scales: 80×80, 40×40, 20×20         │ │
-        │  │ DFL (Distribution Focal Loss) for bbox          │ │
-        │  │ 1 class: pothole                                │ │
-        │  └─────────────────────────────────────────────────┘ │
-        └──────────────────────────────────────────────────────┘
-        ```
-        """)
+                        components.v1.html(fmap._repr_html_(), height=500)
 
-        st.markdown("#### YOLOv3-Tiny (Custom — Educational)")
-        st.markdown("""
-        ```
-        ┌─────────────────────────────────────────────────┐
-        │           INPUT IMAGE (3 × 416 × 416)           │
-        └──────────────────┬──────────────────────────────┘
-                           │
-        ┌──────────────────▼──────────────────────────────┐
-        │  BACKBONE — 7 Conv-BN-LeakyReLU blocks          │
-        │  3→16→32→64→128→256→512→1024                    │
-        │  + MaxPool downsampling (6 stages)              │
-        └──────────────────┬──────────────────────────────┘
-                           │
-        ┌──────────────────▼──────────────────────────────┐
-        │  DETECTION HEAD — 1×1 Conv → [3, 6, 6, 15]     │
-        │  Per anchor: [10 class + 1 obj + 4 bbox]        │
-        └─────────────────────────────────────────────────┘
-        ```
-        """)
+                        st.markdown("### Alerts & Export")
+                        priority_thresh = st.number_input("Alert priority threshold", min_value=0.0, max_value=1.0, value=0.7, step=0.05)
+                        if st.button("Generate Alerts"):
+                            alerts = generate_alerts(enriched, priority_threshold=priority_thresh, out_csv=None)
+                            st.success(f"{len(alerts)} alerts generated (priority >= {priority_thresh})")
+                            geojson_path = os.path.join(PROJECT_ROOT, "results", "detections.geojson")
+                            os.makedirs(os.path.dirname(geojson_path), exist_ok=True)
+                            export_geojson(enriched, geojson_path)
+                            with open(geojson_path, "rb") as geojson_file:
+                                st.download_button("Download GeoJSON", geojson_file, file_name="detections.geojson")
 
-        st.markdown("### 📊 Model Comparison")
-        st.markdown("""
-        | Feature | YOLOv8n | YOLOv3-Tiny (Custom) |
-        |---------|---------|---------------------|
-        | Parameters | 3.0M | 6.3M |
-        | Input Size | 640×640 | 416×416 |
-        | Detection Scales | 3 (multi-scale) | 1 (single) |
-        | Pre-trained | COCO (80 classes) | Scratch |
-        | Anchor Type | Anchor-free | Anchor-based |
-        | FPN | Yes (PANet) | No |
-        | Augmentation | Mosaic, MixUp, etc. | Basic |
-        | Loss | CIoU + DFL | MSE |
-        | Accuracy | High | Low (limited training) |
-        """)
+                    primary_detection = max(enriched, key=lambda item: item["confidence"])
+                    primary_category = primary_detection["category"]
+                    primary_severity = primary_detection["severity_category"]
+                    priority_score = primary_detection["priority_score"]
+                    priority_label = primary_detection["priority_label"]
 
-    # ── Tab 4: Interview Q&A ─────────────────────────────
-    with tab4:
-        st.markdown("### 🎯 Interview Questions & Answers")
-        st.markdown("*Key Deep Learning & Computer Vision concepts covered in this project*")
+                    if user["role"] != ROLE_CITIZEN:
+                        st.info("Detection is available to officers; issue submission is restricted to citizens.")
+                    elif st.session_state.get("submitted_report_key") == upload_key:
+                        _display_submitted_report(st.session_state["last_submitted_report"])
+                    else:
+                        st.markdown("### Submit Civic Issue")
+                        gps_hint = "Image GPS found; edit coordinates if needed." if image_gps else "Location is optional; coordinates are never inferred."
+                        with st.form(f"issue_submission_form_{upload_key}"):
+                            st.caption(gps_hint)
+                            latitude_text = st.text_input(
+                                "Latitude",
+                                value=f"{image_gps[0]:.6f}" if image_gps else "",
+                                key=f"report_latitude_{upload_key}",
+                                placeholder="Optional",
+                            )
+                            longitude_text = st.text_input(
+                                "Longitude",
+                                value=f"{image_gps[1]:.6f}" if image_gps else "",
+                                key=f"report_longitude_{upload_key}",
+                                placeholder="Optional",
+                            )
+                            description = st.text_area(
+                                "Additional description",
+                                key=f"report_description_{upload_key}",
+                            )
+                            submit_report = st.form_submit_button("Submit Civic Issue")
 
-        qa_pairs = [
-            ("What is YOLO and how does it differ from R-CNN?",
-             "YOLO (You Only Look Once) is a single-shot detector that processes the entire image "
-             "in one forward pass, dividing it into a grid and predicting boxes + classes simultaneously. "
-             "R-CNN uses a two-stage approach: first proposing regions, then classifying each. "
-             "YOLO is much faster (real-time) but traditionally less accurate on small objects."),
+                        if submit_report:
+                            latitude = longitude = None
+                            coordinates_valid = True
+                            if bool(latitude_text.strip()) != bool(longitude_text.strip()):
+                                st.error("Enter both coordinates, or leave both blank.")
+                                coordinates_valid = False
+                            elif latitude_text.strip():
+                                try:
+                                    latitude = float(latitude_text.strip())
+                                    longitude = float(longitude_text.strip())
+                                except ValueError:
+                                    st.error("Enter valid latitude and longitude values.")
+                                    coordinates_valid = False
+                            if coordinates_valid:
+                                if latitude is not None and (
+                                    not -90 <= latitude <= 90 or not -180 <= longitude <= 180
+                                ):
+                                    st.error("Latitude must be between -90 and 90; longitude must be between -180 and 180.")
+                                else:
+                                    report = {
+                                        "user_id": str(user["user_id"]),
+                                        "category": primary_category,
+                                        "confidence": float(primary_detection["confidence"]),
+                                        "severity": primary_severity,
+                                        "estimated_repair_cost": primary_detection["estimated_repair_cost"],
+                                        "latitude": latitude,
+                                        "longitude": longitude,
+                                        "reported_at": datetime.now().isoformat(timespec="seconds"),
+                                        "image_path": source_path,
+                                        "status": "NEW",
+                                        "priority_score": priority_score,
+                                        "priority_label": priority_label,
+                                        "description": description.strip() or None,
+                                        "severity_reason": primary_detection["severity_reason"],
+                                        "annotated_image_path": annotated_path,
+                                        "model_name": inference_result.model_name if inference_result else "legacy-yolov3",
+                                        "model_version": inference_result.model_version if inference_result else "legacy",
+                                        "inference_seconds": inference_seconds,
+                                    }
+                                    report["issue_id"] = add_issue(**report, actor=user)
+                                    link_detections_to_issue(detection_ids, report["issue_id"], actor=user)
+                                    saved_report = get_issue_by_id(report["issue_id"], actor=user)
+                                    if saved_report is not None:
+                                        report.update(saved_report)
+                                    st.session_state["submitted_report_key"] = upload_key
+                                    st.session_state["last_submitted_report"] = report
+                                    _display_submitted_report(report)
+                else:
+                    st.info("No detections met the configured confidence threshold.")
+            else:
+                st.error("The uploaded file could not be decoded as an image.")
+        else:
+            st.info("Upload an image above to analyze civic infrastructure.")
 
-            ("Why does YOLOv8 perform better than YOLOv3-Tiny here?",
-             "Three key reasons: 1) Transfer learning — YOLOv8 is pre-trained on COCO (millions of images), "
-             "so it already knows visual features like edges, textures, and shapes. 2) Multi-scale detection — "
-             "FPN/PAN neck provides features at 3 resolutions (80x80, 40x40, 20x20), detecting small and large "
-             "potholes equally well. 3) Modern loss functions — CIoU loss and Distribution Focal Loss produce "
-             "tighter, more accurate bounding boxes."),
-
-            ("Explain Non-Maximum Suppression (NMS).",
-             "NMS eliminates duplicate detections. Algorithm: 1) Sort by confidence, "
-             "2) Take the highest-scoring box, 3) Remove all boxes with IoU > threshold, "
-             "4) Repeat. This ensures each object gets exactly one detection box."),
-
-            ("What is IoU and how is mAP calculated?",
-             "IoU = Area of Overlap / Area of Union between predicted and ground truth boxes. "
-             "mAP is calculated by: 1) Compute Precision-Recall curve per class, "
-             "2) AP = area under PR curve (11-point interpolation), "
-             "3) mAP = mean of AP across all classes. Standard: mAP@0.5 (PASCAL VOC)."),
-
-            ("What is Transfer Learning and why is it critical here?",
-             "Transfer learning uses a model pre-trained on a large dataset (COCO: 80 classes, "
-             "millions of images) and fine-tunes it on your task. The backbone already learned general "
-             "features (edges, textures, shapes). Benefits: requires less data, faster convergence (10-100x), "
-             "better generalization. In our case, YOLOv8n pre-trained backbone dramatically improves "
-             "pothole detection vs training from scratch."),
-
-            ("What is Grad-CAM and why is it useful?",
-             "Grad-CAM uses gradients flowing into the last conv layer to produce a heatmap "
-             "showing which image regions are most important for the prediction. It enables "
-             "model interpretability — crucial for trust, debugging, and deployment in safety-critical "
-             "applications like autonomous driving."),
-
-            ("Explain Feature Pyramid Network (FPN) in YOLOv8.",
-             "FPN creates a multi-scale feature hierarchy by combining low-resolution, "
-             "semantically-strong features with high-resolution, spatially-precise features. "
-             "YOLOv8 uses PANet (Path Aggregation Network): top-down FPN + bottom-up path. "
-             "This lets it detect small potholes (at 80x80) and large ones (at 20x20) equally well."),
-
-            ("How does anchor-free detection in YOLOv8 differ from anchor-based in YOLOv3?",
-             "YOLOv3 uses pre-defined anchor boxes (fixed width/height ratios) and predicts offsets. "
-             "YOLOv8 is anchor-free — it directly predicts the center point and distances to the 4 edges. "
-             "Anchor-free: simpler, no anchor hyperparameter tuning, better generalization to unusual shapes."),
-
-            ("How would you deploy this model in production?",
-             "1) Model optimization: ONNX export, TensorRT, INT8 quantization. "
-             "2) Serving: FastAPI/Flask REST API, or edge with TensorRT on Jetson. "
-             "3) Monitoring: precision/recall drift, input distribution shift. "
-             "4) CI/CD: Automated retraining when new data arrives. "
-             "5) YOLOv8 supports direct export: model.export(format='onnx')"),
-
-            ("What data augmentation does YOLOv8 use?",
-             "YOLOv8 uses aggressive augmentation: Mosaic (4 images combined), MixUp (image blending), "
-             "HSV jitter (hue/saturation/value), Random flip, Scale, Translate, Random erasing. "
-             "Mosaic is particularly powerful — it forces the model to detect objects at various scales "
-             "and in different contexts, dramatically improving robustness."),
-        ]
-
-        for i, (q, a) in enumerate(qa_pairs):
-            with st.expander(f"❓ Q{i+1}: {q}"):
-                st.markdown(f"**Answer:** {a}")
+    # (Grad-CAM, About Model, and Interview Q&A sections were removed per user request)
 
 
 if __name__ == "__main__":

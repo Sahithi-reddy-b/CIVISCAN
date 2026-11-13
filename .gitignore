@@ -7,5 +7,6 @@ __pycache__/
 venv/
 _temp_upload.jpg
 _temp_gradcam.jpg
+data/
 Thumbs.db
 .DS_Store

@@ -1,0 +1,1 @@
+"""CiviScan application pages."""
